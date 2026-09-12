@@ -104,7 +104,8 @@ export const OUTPUT_PATH = path.join(PA1_ROOT, "out", "report.json");
  * properly. `TextDecoder` knows the label "windows-1257" — no dependency needed.
  */
 export function decodeOrderFile(bytes: Buffer): string {
-  throw new Error("TODO: decodeOrderFile is not implemented");
+  const decoder = new TextDecoder("windows-1257");
+  return decoder.decode(bytes);
 }
 
 /**
@@ -115,7 +116,8 @@ export function decodeOrderFile(bytes: Buffer): string {
  * that does not have one.
  */
 export function toIsoDate(ddmmyyyy: string): string {
-  throw new Error("TODO: toIsoDate is not implemented");
+  const [day, month, year] = ddmmyyyy.split(".");
+  return `${year}-${month}-${day}`;
 }
 
 /**
@@ -127,7 +129,7 @@ export function toIsoDate(ddmmyyyy: string): string {
  * parseFloat, and a test checks exactly that.
  */
 export function toDecimalString(amount: string): string {
-  throw new Error("TODO: toDecimalString is not implemented");
+  return amount.replace(",", ".");
 }
 
 /**
@@ -138,7 +140,19 @@ export function toDecimalString(amount: string): string {
  * header row.
  */
 export function parseCustomers(csv: string): Map<string, string> {
-  throw new Error("TODO: parseCustomers is not implemented");
+  const customers = new Map<string, string>();
+  const lines = csv.split(/\r?\n/);
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (line === undefined || line === "") {
+      continue;
+    }
+    const [customerId, fullName] = line.split(";");
+    if (customerId !== undefined && fullName !== undefined) {
+      customers.set(customerId, fullName);
+    }
+  }
+  return customers;
 }
 
 // ------------------------------------------------------------------ ingest --
@@ -160,12 +174,75 @@ export function parseCustomers(csv: string): Map<string, string> {
  *     into `unmatchedCustomers`.
  */
 export function ingest(options: IngestOptions): Report {
-  throw new Error("TODO: ingest is not implemented");
+  const orderBytes = readFileSync(options.ordersPath);
+  const orderText = decodeOrderFile(orderBytes);
+
+  const customerText = readFileSync(options.customersPath, "utf8");
+  const customers = parseCustomers(customerText);
+
+  const orders: Order[] = [];
+  const rejected: RejectedRecord[] = [];
+  const acceptedCustomerIds = new Set<string>();
+
+  const lines = orderText.split(/\r?\n/);
+
+  if (lines.length > 0 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    if (line === undefined) {
+      continue;
+    }
+
+    const lineNumber = i + 1;
+
+    if (line.length !== ORDER_LINE_LENGTH) {
+      rejected.push({
+        line: lineNumber,
+        raw: line,
+        reason: `expected ${ORDER_LINE_LENGTH} characters, got ${line.length}`,
+      });
+
+      continue;
+    }
+
+    const orderId = line.slice(...ORDER_LAYOUT.orderId).trim();
+    const customerId = line.slice(...ORDER_LAYOUT.customerId).trim();
+    const customerName = line.slice(...ORDER_LAYOUT.customerName).trim();
+    const orderDate = line.slice(...ORDER_LAYOUT.orderDate).trim();
+    const amount = line.slice(...ORDER_LAYOUT.amount).trim();
+    const currency = line.slice(...ORDER_LAYOUT.currency).trim();
+
+    orders.push({
+      orderId,
+      customerId,
+      customerName,
+      orderDate: toIsoDate(orderDate),
+      amount: toDecimalString(amount),
+      currency,
+    });
+
+    acceptedCustomerIds.add(customerId);
+  }
+
+  const unmatchedCustomers: string[] = [];
+
+  for (const customerId of customers.keys()) {
+    if (!acceptedCustomerIds.has(customerId)) {
+      unmatchedCustomers.push(customerId);
+    }
+  }
+
+  return {
+    orders,
+    rejected,
+    unmatchedCustomers,
+  };
 }
 
-// -------------------------------------------------------------------- main --
-
-/** Writes the report to pa1/out/report.json. Run with: npm start */
 export function main(): void {
   const report = ingest({
     ordersPath: DEFAULT_ORDERS_PATH,
@@ -177,9 +254,9 @@ export function main(): void {
 
   console.log(
     `wrote ${OUTPUT_PATH}\n` +
-      `  ${report.orders.length} orders\n` +
-      `  ${report.rejected.length} rejected\n` +
-      `  ${report.unmatchedCustomers.length} customers with no order`,
+    `  ${report.orders.length} orders\n` +
+    `  ${report.rejected.length} rejected\n` +
+    `  ${report.unmatchedCustomers.length} customers with no order`,
   );
 }
 
