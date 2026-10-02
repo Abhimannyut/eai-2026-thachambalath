@@ -7,7 +7,7 @@
 * `s0/` — Session 0
 * `pa1/` — PA1: Legacy File Ingestion
 * `pa2/` — PA2: RabbitMQ Publish and Consume
-* `pa3/` — PA3
+* `pa3/` — PA3: Splitter, Content-Based Router, and Aggregator
 * `pa4/` — PA4
 * `pa5/` — PA5
 * `pa6/` — PA6
@@ -33,5 +33,14 @@ npm ci
 npm test
 npm run typecheck
 cd ..
+docker compose down -v
+```
+
+## Running PA3
+
+```bash
+cd pa3
+docker compose up -d --wait
+npm --prefix tests test
 docker compose down -v
 ```

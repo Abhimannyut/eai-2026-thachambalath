@@ -42,20 +42,24 @@ import threading
 import time
 
 
-# TODO: pick a data structure for tracking in-flight orders. You need, per
-# orderId, at least: the results received so far (keyed by itemIndex, so a
-# redelivered duplicate does not get counted twice), the totalItems the
-# order expects, and a last-activity timestamp (used by the timeout sweep
-# below). A plain dict behind a lock is enough; there's no need for
-# anything fancier at this scale.
-#
-# in_flight = {}  # orderId -> {...}
+# in_flight tracks every order currently being aggregated.
+# Structure per orderId:
+#   {
+#       'total_items': int,            # totalItems carried on each item message
+#       'results': {itemIndex: msg},   # dict keyed by itemIndex → dedup for free
+#       'correlation_id': str,
+#       'last_seen': float,            # monotonic timestamp; reset on each arrival
+#   }
+in_flight = {}
 lock = threading.Lock()
 
-# TODO: how long should an order sit with no new results before you give up
-# and emit a partial? Too short and normal processing latency trips it;
-# too long and "partial" stops meaning anything. Write down the number you
-# pick and why in docs/adr-002.md -- this is one of its required decisions.
+# An idle timeout: if no new result arrives for a given order within this many
+# seconds, the order is considered timed-out and a partial result is emitted.
+# We use an *idle* timeout rather than a fixed deadline so that a legitimately
+# large order (50 items, each taking 1–2 s) has its timer reset as long as
+# workers keep delivering — it only times out when a worker goes silent.
+# The value is read from the environment so it can be tuned per deployment
+# (docker-compose.yml sets it to 5 s, which gives workers a realistic window).
 IDLE_TIMEOUT_SECONDS = float(os.environ.get('AGGREGATOR_IDLE_TIMEOUT_SECONDS', '5'))
 
 # How often the background sweep checks for timed-out orders. Independent
@@ -86,30 +90,89 @@ def publish_completion(message):
     connection.close()
 
 
+def build_completion_message(order_id, state, status):
+    """Build the orders.complete payload from aggregated state."""
+    results = state['results']
+    total = state['total_items']
+    received_indexes = set(results.keys())
+    all_indexes = set(range(total))
+    missing = sorted(all_indexes - received_indexes)
+    return {
+        'orderId': order_id,
+        'correlationId': state['correlation_id'],
+        'status': status,
+        'totalItems': total,
+        'receivedItems': len(results),
+        'itemResults': list(results.values()),
+        'missingItemIndexes': missing,
+    }
+
+
 def aggregate_result(ch, method, properties, body):
     """
     Handle one message from orders.results:
     1. Parse it (fields: orderId, correlationId, itemIndex, totalItems,
        plus whatever the worker added -- status, trackingNumber /
        downloadUrl / confirmationCode, itemName, ...).
-    2. TODO: record it against the right order, keyed by itemIndex so a
+    2. Record it against the right order, keyed by itemIndex so a
        redelivered duplicate is a no-op rather than a second entry.
-    3. TODO: update that order's last-activity timestamp (for the sweep).
-    4. TODO: if every expected item has now been recorded, build the
-       "complete" message (see the shape in the module docstring) and
-       call publish_completion(), then drop the order from your in-flight
-       state. Do this within the lock for the state changes, but publish
-       AFTER releasing it.
+    3. Update that order's last-activity timestamp (for the sweep).
+    4. If every expected item has now been recorded, build the
+       "complete" message and call publish_completion(), then drop the
+       order from in-flight state.  State changes under the lock; publish
+       after releasing it.
     5. Ack the message regardless (a bad/unparseable message should not
-       jam the queue -- decide what "bad" means and log it, but don't
-       let it block the good ones. Note that choice in your ADR if it's
-       not obvious).
+       jam the queue).
     """
-    result = json.loads(body)
-    order_id = result['orderId']
+    try:
+        result = json.loads(body)
+        order_id = result['orderId']
+        item_index = result['itemIndex']
+        total_items = result['totalItems']
+        correlation_id = result['correlationId']
+    except (json.JSONDecodeError, KeyError) as exc:
+        print(f"[Aggregator] ERROR: unparseable result message ({exc}), acking and skipping")
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+        return
 
-    # TODO: implement per the docstring above.
-    _ = order_id  # placeholder so linting doesn't complain about the unused var
+    to_publish = None  # completion message to emit after releasing the lock
+
+    with lock:
+        # Initialise state for this order if it's the first result we've seen.
+        if order_id not in in_flight:
+            in_flight[order_id] = {
+                'total_items': total_items,
+                'results': {},
+                'correlation_id': correlation_id,
+                'last_seen': time.monotonic(),
+            }
+
+        state = in_flight[order_id]
+
+        # Deduplicate: if we already have a result for this itemIndex, ignore
+        # the redelivery silently (the dict assignment would overwrite it, but
+        # we skip even that to keep the behaviour a pure no-op).
+        if item_index not in state['results']:
+            state['results'][item_index] = result
+            state['last_seen'] = time.monotonic()
+            print(
+                f"[Aggregator] Order {order_id}: received item {item_index} "
+                f"({len(state['results'])}/{total_items})"
+            )
+        else:
+            print(
+                f"[Aggregator] Order {order_id}: duplicate item {item_index} — ignored"
+            )
+
+        # Check if all items have arrived.
+        if len(state['results']) == total_items:
+            to_publish = build_completion_message(order_id, state, 'complete')
+            del in_flight[order_id]
+            print(f"[Aggregator] Order {order_id}: complete — publishing to orders.complete")
+
+    # Publish outside the lock to avoid holding it during network I/O.
+    if to_publish is not None:
+        publish_completion(to_publish)
 
     ch.basic_ack(delivery_tag=method.delivery_tag)
 
@@ -119,19 +182,33 @@ def sweep_timeouts():
     Runs forever in a background thread, started from main(). Every
     SWEEP_INTERVAL_SECONDS, look for orders that have gone quiet:
 
-    TODO: for every in-flight order whose last-activity timestamp is more
-    than IDLE_TIMEOUT_SECONDS in the past, build the "partial" message
+    For every in-flight order whose last-activity timestamp is more than
+    IDLE_TIMEOUT_SECONDS in the past, build a "partial" message
     (status="partial", missingItemIndexes non-empty) and call
-    publish_completion(), then drop the order from your in-flight state --
-    same lock discipline as aggregate_result: mutate state under the lock,
+    publish_completion(), then drop the order from in-flight state.
+    Same lock discipline as aggregate_result: mutate state under the lock,
     publish after releasing it.
-
-    This is what turns "one worker never responds" from a hang into a
-    completed-but-honest result.
     """
     while True:
         time.sleep(SWEEP_INTERVAL_SECONDS)
-        # TODO: implement per the docstring above.
+
+        now = time.monotonic()
+        timed_out = []
+
+        with lock:
+            for order_id, state in list(in_flight.items()):
+                idle_for = now - state['last_seen']
+                if idle_for >= IDLE_TIMEOUT_SECONDS:
+                    timed_out.append((order_id, build_completion_message(order_id, state, 'partial')))
+                    del in_flight[order_id]
+                    print(
+                        f"[Aggregator] Order {order_id}: timed out after "
+                        f"{idle_for:.1f}s idle — publishing partial result"
+                    )
+
+        # Publish outside the lock.
+        for order_id, msg in timed_out:
+            publish_completion(msg)
 
 
 def main():
