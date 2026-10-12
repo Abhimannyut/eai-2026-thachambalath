@@ -8,7 +8,7 @@
 * `pa1/` — PA1: Legacy File Ingestion
 * `pa2/` — PA2: RabbitMQ Publish and Consume
 * `pa3/` — PA3: Splitter, Content-Based Router, and Aggregator
-* `pa4/` — PA4
+* `pa4/` — PA4: Three Sources to One Canonical Model
 * `pa5/` — PA5
 * `pa6/` — PA6
 * `pa7/` — PA7
@@ -42,5 +42,19 @@ docker compose down -v
 cd pa3
 docker compose up -d --wait
 npm --prefix tests test
+docker compose down -v
+```
+
+## Running PA4
+
+```bash
+cd pa4
+docker compose up -d --wait
+cd starter
+npm ci
+npm test
+npm run typecheck
+npm start
+cd ..
 docker compose down -v
 ```
