@@ -58,3 +58,22 @@ npm start
 cd ..
 docker compose down -v
 ```
+
+## Running PA5
+
+```bash
+cd pa5
+docker compose up -d --build --wait
+npm test
+docker compose down -v
+```
+
+## Running PA6
+
+```bash
+cd pa6
+docker compose up -d --build --wait
+npm test
+docker compose down -v
+```
+
