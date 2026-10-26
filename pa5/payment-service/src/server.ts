@@ -43,7 +43,29 @@ async function main(): Promise<void> {
       // available here if your validation wants to look at it (e.g. reject
       // orders over some amount) — this simulation does not require it.
 
-      throw new Error("Not implemented — replace this with your logic");
+      // Simulate payment validation: fail randomly based on FAIL_RATE
+      if (Math.random() * 100 < FAIL_RATE) {
+        throw new Error(`Payment failed (simulated, fail rate ${FAIL_RATE}%)`);
+      }
+
+      // Success: ack and publish result event
+      channel.ack(msg);
+      channel.publish(
+        RESULTS_EXCHANGE,
+        "",
+        Buffer.from(JSON.stringify({
+          correlationId,
+          source: "payment",
+          status: "success",
+          timestamp: new Date().toISOString(),
+          details: { message: `Payment validated for order ${order.orderId}` },
+        })),
+        {
+          headers: { correlationId },
+          contentType: "application/json",
+        }
+      );
+      console.log(`[Payment] -> Success ${correlationId}`);
     } catch (err) {
       // Retry / DLQ logic (provided as reference — study this for the other
       // two services). Do not modify.
