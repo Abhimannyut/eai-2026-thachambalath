@@ -1,0 +1,10 @@
+{
+  "orderId": "ord-fixture-001",
+  "customerId": "cust-fixture-1",
+  "recipient": "fixture@example.test",
+  "items": [
+    { "sku": "widget-a", "quantity": 2, "price": 14.50 },
+    { "sku": "widget-b", "quantity": 1, "price": 7.99 }
+  ],
+  "amount": 36.99
+}
