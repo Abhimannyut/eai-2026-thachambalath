@@ -128,3 +128,4 @@ export interface SagaRecord {
   /** ISO-8601 timestamp of the last update to this record. */
   updatedAt: string;
 }
+

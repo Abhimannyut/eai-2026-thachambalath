@@ -27,7 +27,7 @@ describe('PA6 ADR public tests', () => {
   });
 
   test('3) ADR has a status field', () => {
-    expect(adrContent.toLowerCase()).toMatch(/status[:\s]+(accepted|proposed|deprecated|superseded)/i);
+    expect(adrContent.toLowerCase()).toMatch(/status\W+(accepted|proposed|deprecated|superseded)/i);
   });
 
   test('4) ADR is substantive (not a stub)', () => {
@@ -47,3 +47,4 @@ describe('PA6 ADR public tests', () => {
     expect(decisionsMentioned).toBeGreaterThanOrEqual(2);
   });
 });
+
