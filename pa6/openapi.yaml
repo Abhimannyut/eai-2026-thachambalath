@@ -1,23 +1,23 @@
 openapi: 3.0.3
 info:
-  title: PA6 Checkout Orchestration API
+  title: PA6 Checkout Saga Orchestrator Contract
   version: 1.0.0
   description: >-
-    Contract for the PA6 checkout saga orchestrator. A single POST /checkout
-    call drives four downstream steps — payment authorization, inventory
-    reservation, shipping creation and notification delivery — in strict
-    sequential order. Failed or timed-out steps trigger reverse-order
-    compensation where compensating actions exist. Idempotency is enforced
-    via the Idempotency-Key header so safe client retries never double-charge.
+    Contract for the PA6 checkout saga orchestrator. Drives payment authorization,
+    inventory reservation, shipping creation, and customer notification sequentially
+    for an incoming canonical order. Steps execute strictly one after another.
+    Upon downstream error or timeout, completed steps with compensation capability
+    (inventory and payment) roll back in reverse order. Replays and in-flight conflicts
+    are managed idempotently using the Idempotency-Key header.
   contact:
     name: Course Support
     email: support@example.com
 servers:
   - url: http://localhost:3000
-    description: Local orchestrator started via docker compose.
+    description: Local orchestrator instance.
 tags:
   - name: system
-    description: Operational and health-check endpoints.
+    description: System health and readiness probes.
   - name: checkout
     description: Order checkout saga orchestration endpoints.
 paths:
@@ -26,13 +26,11 @@ paths:
       operationId: getHealth
       tags:
         - system
-      summary: Liveness probe
-      description: >-
-        Returns 200 when the orchestrator process is up and accepting
-        requests. Used by Docker health checks and smoke tests.
+      summary: Liveness health check
+      description: Returns HTTP 200 with status ok when the orchestrator process is up.
       responses:
         "200":
-          description: The orchestrator is running and ready to accept requests.
+          description: The orchestrator process is healthy and ready to process sagas.
           content:
             application/json:
               schema:
@@ -42,79 +40,62 @@ paths:
       operationId: createCheckout
       tags:
         - checkout
-      summary: Execute the checkout saga for one order
+      summary: Run checkout saga for one canonical order
       description: >-
-        Runs payment authorization, inventory reservation, shipping creation
-        and notification delivery in strict sequence for a single order.
-        Steps are never parallelised — each starts only after the previous
-        succeeds. On any downstream failure or timeout, steps that have
-        compensating actions (payment, inventory) are rolled back in reverse
-        completion order before the response is sent. The Idempotency-Key
-        header makes the entire call safe to retry: the same key and payload
-        replay the original result; the same key with a different payload is
-        rejected immediately.
+        Orchestrates checkout across four downstream services (payment, inventory, shipping, notification)
+        in strict sequence. Computes total charge amount in cents as a decimal string and dispatches notification
+        to customer email. Triggers reverse compensation for inventory and payment on failure.
       parameters:
         - name: Idempotency-Key
           in: header
           required: true
           description: >-
-            Client-generated key scoping retries of exactly this checkout
-            request. The same key with the same request body always replays
-            the first result. The same key with a different body returns 409
-            idempotency_payload_mismatch. A key that is already in-flight
-            returns 409 idempotency_conflict.
+            Unique idempotency token supplied by the caller. Enforces safe replays and prevents duplicate charges.
+            Replays of identical payload return the cached response. Conflicting payloads or concurrent runs yield HTTP 409.
           schema:
             type: string
             minLength: 1
       requestBody:
         required: true
         description: >-
-          The order to run through the checkout saga. Must contain an orderId,
-          at least one line item, a total amount and a notification recipient.
+          The canonical order payload complying with canonical/order.schema.json, with bounded line items.
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/CheckoutRequest"
+              $ref: "#/components/schemas/CanonicalOrder"
       responses:
         "200":
           description: >-
-            All four saga steps succeeded. The saga status is completed and
-            the trace contains one entry per step.
+            All four forward steps succeeded without errors. Saga state is completed.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/CheckoutResponse"
         "400":
           description: >-
-            The request body failed validation (missing required field, wrong
-            type) or the Idempotency-Key header is absent.
+            Validation error: missing Idempotency-Key header, invalid canonical order schema, or unbounded item count.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
         "409":
           description: >-
-            The Idempotency-Key is already associated with a different request
-            body (idempotency_payload_mismatch), or a request with this key is
-            still executing (idempotency_conflict).
+            Idempotency conflict: key matches an in-flight saga (idempotency_conflict) or an existing key was reused with a different request payload (idempotency_payload_mismatch).
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
         "422":
           description: >-
-            A downstream step returned a business failure. If compensation
-            steps ran and all succeeded the saga status is compensated. If any
-            compensation step also failed the status is failed and the code
-            is compensation_failed.
+            A downstream service rejected the transaction. Compensation executed in reverse order.
+            Returns status compensated on successful rollback, or failed with code compensation_failed if rollback failed.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/CheckoutResponse"
         "504":
           description: >-
-            A downstream call exceeded REQUEST_TIMEOUT_MS. The code is always
-            timeout. Compensation ran for any steps that had already completed.
+            A downstream step exceeded the timeout deadline. Code is timeout and compensation has executed for earlier steps.
           content:
             application/json:
               schema:
@@ -123,75 +104,164 @@ components:
   schemas:
     HealthStatus:
       type: object
-      description: Minimal liveness payload returned by the health endpoint.
+      description: Health check response body.
       required:
         - status
       properties:
         status:
           type: string
-          description: Always the string "ok" when the service can accept requests.
+          description: Liveness state indicator, always ok.
           enum:
             - ok
-    CheckoutItem:
+    Address:
       type: object
-      description: One line item within an order submitted for checkout.
+      description: Customer delivery postal address.
+      additionalProperties: false
       required:
-        - sku
-        - quantity
-        - price
+        - street
+        - city
+        - postalCode
+        - country
       properties:
-        sku:
+        street:
           type: string
-          description: Stock-keeping unit identifier for the product.
+          description: Street name and building number.
+          minLength: 1
+        city:
+          type: string
+          description: City or municipality name.
+          minLength: 1
+        postalCode:
+          type: string
+          description: National postal code format.
+          minLength: 1
+        country:
+          type: string
+          description: Two-letter ISO 3166-1 alpha-2 country code.
+          minLength: 2
+          maxLength: 2
+    Customer:
+      type: object
+      description: Customer profile associated with the order.
+      additionalProperties: false
+      required:
+        - name
+        - email
+        - address
+      properties:
+        name:
+          type: string
+          description: Customer full legal or display name.
+          minLength: 1
+        email:
+          type: string
+          description: Customer contact email receiving notifications.
+          format: email
+        address:
+          $ref: "#/components/schemas/Address"
+    OrderItem:
+      type: object
+      description: Single line item belonging to the canonical order.
+      additionalProperties: false
+      required:
+        - productId
+        - productName
+        - quantity
+        - unitPrice
+        - currency
+        - taxRate
+      properties:
+        productId:
+          type: string
+          description: Pricing-compliant product SKU.
+          pattern: "^PROD-[0-9]+$"
+        productName:
+          type: string
+          description: Descriptive name of product.
           minLength: 1
         quantity:
           type: integer
-          description: Number of units of this SKU on the order.
+          description: Quantity of product units purchased.
           minimum: 1
-        price:
+        unitPrice:
+          type: string
+          description: Two-decimal string price unit, e.g. 19.99.
+          pattern: "^-?[0-9]+\\.[0-9]{2}$"
+        currency:
+          type: string
+          description: Three-letter ISO currency code.
+          minLength: 3
+        taxRate:
           type: number
-          description: Unit price of one item in the order currency.
+          description: Fractional tax rate between 0 and 1.
           minimum: 0
-    CheckoutRequest:
+          maximum: 1
+    CanonicalOrder:
       type: object
-      description: The order payload to run through the four-step checkout saga.
+      description: >-
+        Inbound canonical order conforming to canonical/order.schema.json with explicit item array bounds.
+      additionalProperties: false
       required:
         - orderId
+        - orderType
+        - source
+        - receivedAt
+        - orderDate
+        - customer
         - items
-        - amount
-        - recipient
+        - currency
+        - status
       properties:
         orderId:
           type: string
-          description: Caller-supplied unique identifier for the order. Not generated by the orchestrator.
+          description: Globally unique identifier for this order.
           minLength: 1
-        customerId:
+        orderType:
           type: string
-          description: Identifier of the customer placing the order. Optional; forwarded to downstream services.
-        recipient:
+          description: Classification of order processing speed and tier.
+          enum:
+            - standard
+            - express
+            - b2b
+        source:
           type: string
-          description: Email address to which the notification step sends a confirmation.
-          format: email
+          description: Upstream originator platform channel.
+          enum:
+            - web
+            - mobile
+            - b2b
+        receivedAt:
+          type: string
+          description: Ingestion timestamp recorded by canonical translator.
+          format: date-time
+        orderDate:
+          type: string
+          description: Original order placement timestamp in UTC.
+          format: date-time
+        customer:
+          $ref: "#/components/schemas/Customer"
         items:
           type: array
-          description: >-
-            Ordered line items. Must contain at least one entry. Capped at 50
-            to keep a single saga call cheap to retry and to bound downstream
-            inventory payloads.
+          description: Enforced bound of line items per checkout transaction.
           minItems: 1
           maxItems: 50
           items:
-            $ref: "#/components/schemas/CheckoutItem"
-        amount:
-          type: number
-          description: Total order amount passed to the payment authorization step.
-          minimum: 0
+            $ref: "#/components/schemas/OrderItem"
+        currency:
+          type: string
+          description: Currency applied to the entire order.
+          minLength: 3
+        status:
+          type: string
+          description: Lifecycle state of the order upon submission.
+          enum:
+            - new
+            - processing
+            - shipped
+            - delivered
     TraceItem:
       type: object
-      description: >-
-        Record of one saga step as it actually executed, in real wall-clock
-        order. Compensation steps are included immediately after the forward
-        step that failed.
+      description: Recorded execution timing and status of an individual saga forward or compensation step.
       required:
         - step
         - status
@@ -201,34 +271,30 @@ components:
       properties:
         step:
           type: string
-          description: >-
-            Name of the step: payment, inventory, shipping, notification,
-            inventory_release or payment_refund.
+          description: Identifying label for the saga step.
           minLength: 1
         status:
           type: string
-          description: Outcome of the step — success, failed or timeout.
+          description: Completion outcome of the step.
           enum:
             - success
             - failed
             - timeout
         startedAt:
           type: string
-          description: ISO-8601 timestamp recorded immediately before the downstream call.
+          description: ISO-8601 start timestamp.
           format: date-time
         finishedAt:
           type: string
-          description: ISO-8601 timestamp recorded immediately after the downstream call returns or times out.
+          description: ISO-8601 finish timestamp.
           format: date-time
         durationMs:
           type: integer
-          description: Wall-clock duration of the step in milliseconds, derived from startedAt/finishedAt.
+          description: Wall-clock step execution time in milliseconds.
           minimum: 0
     CheckoutResponse:
       type: object
-      description: >-
-        Result returned by POST /checkout once the saga has reached a terminal
-        state. Returned on HTTP 200, 422 and 504.
+      description: Terminal payload returned by POST /checkout.
       required:
         - orderId
         - status
@@ -236,53 +302,41 @@ components:
       properties:
         orderId:
           type: string
-          description: Echoes the orderId from the request body.
+          description: The order identifier passed in the request.
           minLength: 1
         status:
           type: string
-          description: >-
-            Terminal saga state. completed means all four steps succeeded.
-            compensated means a step failed and compensation ran fully.
-            failed means a step failed and compensation also failed.
+          description: Terminal saga outcome status.
           enum:
             - completed
-            - compensated
             - failed
+            - compensated
+            - in_progress
         code:
           type: string
-          description: >-
-            Machine-readable reason code present on non-completed outcomes:
-            timeout, compensation_failed, or a step-level code such as
-            payment_declined.
+          description: Machine-readable reason code for errors and compensations.
           minLength: 1
         trace:
           type: array
-          description: >-
-            Ordered record of every step the saga ran, including compensation
-            steps. The maximum is bounded: four forward steps plus two
-            compensation steps equals six; the limit of 12 leaves headroom for
-            any additional steps added in future without breaking existing
-            clients.
-          maxItems: 12
+          description: Ordered sequence of all forward and compensation steps executed.
+          maxItems: 16
           items:
             $ref: "#/components/schemas/TraceItem"
     ErrorResponse:
       type: object
-      description: >-
-        Machine-readable error shape returned for validation failures (400) and
-        idempotency conflicts (409). Not used for saga failures — those use
-        CheckoutResponse so the trace is preserved.
+      description: Structured error body for HTTP 400 and 409 responses.
       required:
         - code
         - message
       properties:
         code:
           type: string
-          description: >-
-            Stable machine-readable code: validation_error,
-            idempotency_payload_mismatch or idempotency_conflict.
-          minLength: 1
+          description: Machine-readable error code.
+          enum:
+            - validation_error
+            - idempotency_conflict
+            - idempotency_payload_mismatch
         message:
           type: string
-          description: Human-readable explanation suitable for developer-facing error messages.
+          description: Informative explanation of validation or conflict failure.
           minLength: 1
