@@ -34,6 +34,9 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import express, { type Request, type Response as ExpressResponse } from "express";
+import Ajv from "ajv";
+import addFormats from "ajv-formats";
+import type { CanonicalOrder, CanonicalItem } from "./canonical-order";
 
 type FetchResponse = Awaited<ReturnType<typeof fetch>>;
 
@@ -71,9 +74,58 @@ function loadConfig(): Config {
 
 const config = loadConfig();
 
+// ------------------------------------------------------------- validation ---
+
+function findCanonicalSchemaPath(): string {
+  const candidates = [
+    process.env.CANONICAL_SCHEMA_PATH,
+    "/canonical/order.schema.json",
+    path.resolve(process.cwd(), "..", "..", "canonical", "order.schema.json"),
+    path.resolve(process.cwd(), "..", "canonical", "order.schema.json"),
+  ];
+  for (const c of candidates) {
+    if (c && fs.existsSync(c)) return c;
+  }
+  throw new Error("Cannot locate canonical/order.schema.json");
+}
+
+const canonicalSchemaPath = findCanonicalSchemaPath();
+const ajv = new Ajv({ allErrors: true });
+addFormats(ajv);
+const validateCanonicalOrder = ajv.compile(JSON.parse(fs.readFileSync(canonicalSchemaPath, "utf8")));
+
+const MAX_ITEMS_BOUND = 50;
+
+function validateCheckoutPayload(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") {
+    return "Request body must be a JSON object";
+  }
+  if (!validateCanonicalOrder(payload)) {
+    return `Request body is not a canonical order: ${ajv.errorsText(validateCanonicalOrder.errors, { dataVar: "body" })}`;
+  }
+  const order = payload as CanonicalOrder;
+  if (!Array.isArray(order.items) || order.items.length === 0) {
+    return 'Field "items" must be a non-empty array';
+  }
+  if (order.items.length > MAX_ITEMS_BOUND) {
+    return `Field "items" exceeds maximum bound of ${MAX_ITEMS_BOUND} items`;
+  }
+  return null;
+}
+
+// Sum unitPrice * quantity over order.items in whole cents, formatting as two-digit decimal string
+function calculateAmount(items: CanonicalItem[]): string {
+  let cents = 0;
+  for (const item of items) {
+    const [whole, fraction] = item.unitPrice.split(".");
+    cents += (Number(whole) * 100 + Number(fraction)) * item.quantity;
+  }
+  return `${Math.floor(cents / 100)}.${String(cents % 100).padStart(2, "0")}`;
+}
+
 // ----------------------------------------------------------------- stores ---
 
-const DATA_DIR = "/data";
+const DATA_DIR = fs.existsSync("/data") ? "/data" : path.resolve(process.cwd(), "data");
 const IDEMPOTENCY_STORE_PATH = path.join(DATA_DIR, "idempotency-store.json");
 const SAGA_STORE_PATH = path.join(DATA_DIR, "saga-store.json");
 
@@ -92,7 +144,7 @@ interface IdempotencyRecord {
   requestHash: string;
   state: IdempotencyState;
   httpStatus: number;
-  response: unknown;
+  response: Record<string, unknown>;
   updatedAt: string;
 }
 
@@ -114,8 +166,9 @@ interface SagaStore {
 function ensureJsonFile(filePath: string, initialData: unknown): void {
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  if (!fs.existsSync(filePath))
+  if (!fs.existsSync(filePath)) {
     fs.writeFileSync(filePath, JSON.stringify(initialData, null, 2), "utf8");
+  }
 }
 
 function readJsonFile<T>(filePath: string): T {
@@ -144,20 +197,6 @@ function payloadHash(payload: unknown): string {
   return `sha256:${crypto.createHash("sha256").update(normalized).digest("hex")}`;
 }
 
-function validateCheckoutPayload(payload: unknown): string | null {
-  if (!payload || typeof payload !== "object") return "Request body must be a JSON object";
-  const p = payload as Record<string, unknown>;
-  if (typeof p.orderId !== "string" || p.orderId.trim() === "")
-    return 'Field "orderId" is required and must be a non-empty string';
-  if (!Array.isArray(p.items) || p.items.length === 0)
-    return 'Field "items" is required and must be a non-empty array';
-  if (typeof p.amount !== "number")
-    return 'Field "amount" is required and must be numeric';
-  if (typeof p.recipient !== "string" || p.recipient.trim() === "")
-    return 'Field "recipient" is required and must be a non-empty string';
-  return null;
-}
-
 // Timeout-aware fetch: throws with .isTimeout=true when the deadline elapses.
 async function fetchWithTimeout(
   url: string,
@@ -172,7 +211,8 @@ async function fetchWithTimeout(
   } catch (err: unknown) {
     if (
       err instanceof Error &&
-      (err.name === "AbortError" || err.name === "TimeoutError" ||
+      (err.name === "AbortError" ||
+        err.name === "TimeoutError" ||
         (err as NodeJS.ErrnoException).code === "UND_ERR_CONNECT_TIMEOUT" ||
         controller.signal.aborted)
     ) {
@@ -186,7 +226,7 @@ async function fetchWithTimeout(
   }
 }
 
-// Run one step of the saga; records to trace[]; throws on failure/timeout.
+// Run one forward step of the saga; records to trace[]; throws on failure/timeout.
 async function runStep(
   stepName: string,
   url: string,
@@ -196,9 +236,6 @@ async function runStep(
 ): Promise<unknown> {
   const startedAt = nowIso();
   const startMs = Date.now();
-
-  let finishedAt: string;
-  let durationMs: number;
 
   try {
     const res = await fetchWithTimeout(
@@ -211,39 +248,36 @@ async function runStep(
       timeoutMs,
     );
 
-    finishedAt = nowIso();
-    durationMs = Date.now() - startMs;
+    const finishedAt = nowIso();
+    const durationMs = Date.now() - startMs;
 
     if (!res.ok) {
       trace.push({ step: stepName, status: "failed", startedAt, finishedAt, durationMs });
-      const errBody = await res.json().then((v: unknown) => v).catch(() => ({}));
-      const err = new Error(`Step ${stepName} failed: ${res.status}`);
+      const errBody = await res.json().catch(() => ({}));
+      const err = new Error(`Step ${stepName} failed with HTTP ${res.status}`);
       (err as any).stepError = errBody;
       throw err;
     }
 
     trace.push({ step: stepName, status: "success", startedAt, finishedAt, durationMs });
-    return await res.json().then((v: unknown) => v).catch(() => ({}));
+    return await res.json().catch(() => ({}));
   } catch (err: unknown) {
+    const finishedAt = nowIso();
+    const durationMs = Date.now() - startMs;
+
     if ((err as any).isTimeout) {
-      finishedAt = nowIso();
-      durationMs = Date.now() - startMs;
       trace.push({ step: stepName, status: "timeout", startedAt, finishedAt, durationMs });
       (err as any).isTimeout = true;
       throw err;
     }
-    // Already pushed to trace above for non-timeout failures
-    if (!(err as any).stepError && !(err as any).isTimeout) {
-      finishedAt = nowIso();
-      durationMs = Date.now() - startMs;
+    if (!(err as any).stepError) {
       trace.push({ step: stepName, status: "failed", startedAt, finishedAt, durationMs });
     }
     throw err;
   }
 }
 
-// Run one compensation step; records to trace[]; does NOT throw — a
-// compensation failure is recorded and returned as false.
+// Run one compensation step; records to trace[]; does NOT throw — returns boolean.
 async function runCompensation(
   stepName: string,
   url: string,
@@ -299,7 +333,7 @@ app.get("/debug/trace/:orderId", (req: Request, res: ExpressResponse) => {
 app.post("/checkout", (req: Request, res: ExpressResponse) => {
   // ---- header validation ----
   const idempotencyKey = req.header("Idempotency-Key");
-  if (!idempotencyKey) {
+  if (!idempotencyKey || idempotencyKey.trim() === "") {
     res.status(400).json({ code: "validation_error", message: "Idempotency-Key header is required" });
     return;
   }
@@ -311,7 +345,8 @@ app.post("/checkout", (req: Request, res: ExpressResponse) => {
     return;
   }
 
-  const orderId: string = (req.body as Record<string, unknown>).orderId as string;
+  const order = req.body as CanonicalOrder;
+  const orderId = order.orderId;
   const requestHash = payloadHash(req.body);
 
   const idempotencyStore = readJsonFile<IdempotencyStore>(IDEMPOTENCY_STORE_PATH);
@@ -353,17 +388,12 @@ app.post("/checkout", (req: Request, res: ExpressResponse) => {
   };
   writeJsonFile(IDEMPOTENCY_STORE_PATH, idempotencyStore);
 
-  // ---- run the saga asynchronously so we can send res at the end ----
+  // ---- execute saga asynchronously ----
   void (async () => {
     const trace: TraceItem[] = [];
-    const payload = req.body as {
-      orderId: string;
-      amount: number;
-      items: unknown[];
-      recipient: string;
-    };
+    const amount = calculateAmount(order.items);
+    const recipient = order.customer.email;
 
-    // Track which steps completed so we know what to compensate.
     let paymentDone = false;
     let inventoryDone = false;
 
@@ -373,58 +403,57 @@ app.post("/checkout", (req: Request, res: ExpressResponse) => {
     let isTimeout = false;
 
     try {
-      // Step 1 — payment authorize
+      // Step 1 — payment authorize { orderId, amount }
       await runStep(
         "payment",
         `${config.paymentUrl}/payment/authorize`,
-        { orderId: payload.orderId, amount: payload.amount },
+        { orderId, amount },
         trace,
         config.requestTimeoutMs,
       );
       paymentDone = true;
 
-      // Step 2 — inventory reserve
+      // Step 2 — inventory reserve { orderId, items }
       await runStep(
         "inventory",
         `${config.inventoryUrl}/inventory/reserve`,
-        { orderId: payload.orderId, items: payload.items },
+        { orderId, items: order.items },
         trace,
         config.requestTimeoutMs,
       );
       inventoryDone = true;
 
-      // Step 3 — shipping create
+      // Step 3 — shipping create { orderId }
       await runStep(
         "shipping",
         `${config.shippingUrl}/shipping/create`,
-        { orderId: payload.orderId },
+        { orderId },
         trace,
         config.requestTimeoutMs,
       );
 
-      // Step 4 — notification send
+      // Step 4 — notification send { orderId, recipient }
       await runStep(
         "notification",
         `${config.notificationUrl}/notification/send`,
-        { orderId: payload.orderId, recipient: payload.recipient },
+        { orderId, recipient },
         trace,
         config.requestTimeoutMs,
       );
 
-      // All steps succeeded
       sagaState = "completed";
       finalHttpStatus = 200;
     } catch (err: unknown) {
       isTimeout = !!(err as any).isTimeout;
 
-      // Compensate in reverse order: inventory first, then payment
+      // Compensate completed steps in strict reverse order: inventory first, then payment
       let compensationFailed = false;
 
       if (inventoryDone) {
         const ok = await runCompensation(
           "inventory_release",
           `${config.inventoryUrl}/inventory/release`,
-          { orderId: payload.orderId },
+          { orderId },
           trace,
           config.requestTimeoutMs,
         );
@@ -435,7 +464,7 @@ app.post("/checkout", (req: Request, res: ExpressResponse) => {
         const ok = await runCompensation(
           "payment_refund",
           `${config.paymentUrl}/payment/refund`,
-          { orderId: payload.orderId },
+          { orderId },
           trace,
           config.requestTimeoutMs,
         );
@@ -447,17 +476,20 @@ app.post("/checkout", (req: Request, res: ExpressResponse) => {
         finalHttpStatus = 422;
         finalCode = "compensation_failed";
       } else if (isTimeout) {
-        sagaState = "compensated";
+        sagaState = paymentDone ? "compensated" : "failed";
         finalHttpStatus = 504;
         finalCode = "timeout";
       } else {
-        sagaState = "compensated";
+        sagaState = paymentDone ? "compensated" : "failed";
         finalHttpStatus = 422;
-        finalCode = undefined;
+        const stepCode = (err as any).stepError?.code;
+        if (typeof stepCode === "string") {
+          finalCode = stepCode;
+        }
       }
     }
 
-    // Build response body
+    // Build terminal response body
     const responseBody: Record<string, unknown> = {
       orderId,
       status: sagaState,
@@ -465,7 +497,7 @@ app.post("/checkout", (req: Request, res: ExpressResponse) => {
     };
     if (finalCode) responseBody.code = finalCode;
 
-    // Persist saga
+    // Persist to saga store
     const sagaStore = readJsonFile<SagaStore>(SAGA_STORE_PATH);
     if (!sagaStore.sagas) sagaStore.sagas = {};
     sagaStore.sagas[orderId] = {
@@ -476,7 +508,7 @@ app.post("/checkout", (req: Request, res: ExpressResponse) => {
     };
     writeJsonFile(SAGA_STORE_PATH, sagaStore);
 
-    // Persist idempotency record with final state
+    // Persist final idempotency record
     const finalIdempotencyState: IdempotencyState =
       sagaState === "completed" ? "completed" : sagaState === "compensated" ? "compensated" : "failed";
 
